@@ -11,13 +11,35 @@ import sys
 import torch
 
 TYPES = {
+    # Integer types
+    "int64" : torch.int64,
+    "uint64": torch.uint64,
+    "int32" : torch.int32,
+    "uint32": torch.uint32,
+    "int16" : torch.int16,
+    "uint16": torch.uint16,
+    "int8"  : torch.int8,
+    "uint8" : torch.uint8,
+
+    # Real fp types
+    "fp64": torch.float64,
     "fp32": torch.float32,
     "bf16": torch.bfloat16,
     "e5m2": torch.float8_e5m2,
     "e4m3": torch.float8_e4m3fn,
+
+    # Complex fp types
+    "complex128" : torch.complex128,
+    "complex64"  : torch.complex64,
+    "complex32"  : torch.complex32,
 }
 
 parser = argparse.ArgumentParser()
+parser.add_argument(
+    "-v",
+    "--verbose",
+    action="store_true",
+)
 parser.add_argument(
     "--module", help="Python module implementing the NN", type=str, required=True
 )
@@ -34,11 +56,11 @@ parser.add_argument(
     required=True,
 )
 parser.add_argument(
-    "--input_type",
-    help="Parameter type of the input",
+    "--target_type",
+    help="Target parameter type; only parameters of this type will be converted",
     type=str,
-    choices=["fp32"],
-    default="fp32",
+    choices=TYPES.keys(),
+    required=True,
 )
 parser.add_argument(
     "--output",
@@ -50,7 +72,7 @@ parser.add_argument(
     "--type",
     help="Type of the parameters to be converted to",
     type=str,
-    choices=["bf16", "e5m2", "e4m3"],
+    choices=TYPES.keys(),
     required=True,
 )
 args = parser.parse_args()
@@ -59,9 +81,13 @@ module = importlib.import_module(args.module)
 nn = getattr(module, args.nn_name)()
 
 input_object = torch.load(args.input, map_location="cpu", weights_only=True)
-input_state_dict = input_object["model_state_dict"]
+input_state_dict = (
+    input_object["model_state_dict"]
+    if "model_state_dict" in input_object.keys()
+    else input_object
+)
 
-input_type = TYPES[args.input_type]
+target_type = TYPES[args.target_type]
 new_type = TYPES[args.type]
 
 # Make sure the saved model matches with the NN
@@ -77,10 +103,14 @@ while True:
 new_state_dict = {}
 for key, val in input_state_dict.items():
     if isinstance(val, torch.Tensor):
-        if val.dtype != input_type:
-            print(f"dtype for tensor {key} != {args.input_type} (expected), aborting")
-            sys.exit(1)
-        new_state_dict[key] = val.to(dtype=new_type)
+        if val.dtype != target_type:
+            if args.verbose:
+                print(f"{key} has type {val.dtype} (!= {target_type}), skipping conversion")
+            new_state_dict[key] = val
+        else:
+            if args.verbose:
+                print(f"Converting {key} to {new_type}")
+            new_state_dict[key] = val.to(dtype=new_type)
     else:
         new_state_dict[key] = val
 
