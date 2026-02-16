@@ -63,63 +63,85 @@ input_state_dict = (
 )
 
 # Make sure the saved model matches the NN
-while True:
-    try:
-        original_nn.load_state_dict(input_state_dict, strict=True)
-        break
-    except RuntimeError as err:
-        print(f"Saved model does not match with the NN: {err}")
-        sys.exit(1)
+try:
+    original_nn.load_state_dict(input_state_dict, strict=True)
+except RuntimeError as err:
+    print(f"Saved model does not match with the NN: {err}")
+    sys.exit(1)
 
-# We are assuming that the target top-level modules all only have one sequential list
-# assert(all(len(module) == 1 for module in target_modules.values()))
+def fuse_conv_bn(conv, bn, use_float64=False):
+    """
+    Fuse a Conv2d and BatchNorm2d into a single Conv2d with bias.
+    ref: https://nenadmarkus.com/p/fusing-batchnorm-and-conv/
+    """
+    fused = torch.nn.Conv2d(
+        conv.in_channels, conv.out_channels,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=True,
+    )
 
-found_target_module = False
+    # W_bn = diag(gamma / sqrt(var + eps))
+    w_conv = conv.weight.clone().view(conv.out_channels, -1)
+    w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.running_var + bn.eps)))
 
-# Iterate over each module
-# For target modules, find conv and bn layers that can be fused
-# For non-target modules, add them to the new NN
-new_nn = torch.nn.Module()
-for name, module in original_nn.named_modules():
-    if name not in args.nn_module:
-        setattr(new_nn, name, module)
-        continue
+    # b_fused = W_bn @ b_conv + (beta - gamma * mean / sqrt(var + eps))
+    b_conv = conv.bias if conv.bias is not None else torch.zeros(conv.out_channels)
+    b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
 
-    found_target_module = True
-    if args.verbose:
-        printf(f"Found target module {name}")
+    with torch.no_grad():
+        fused.weight.copy_(torch.mm(w_bn, w_conv).view(fused.weight.size()))
+        fused.bias.copy_(torch.mm(w_bn, b_conv.unsqueeze(1)).squeeze(1) + b_bn)
 
-    mlist = target_modules[name][0]
+    return fused
 
-    # Use a simple pointer to iterate over the layers and skip fusable batchnorms
-    i = 0
-    new_mlist = []
-    while i < len(mlist):
-        new_mlist.append(mlist[i])
-        if isinstance(mlist[i], torch.nn.Conv2d):
-            # If the next layer is batchnorm, we can fuse it
-            if (i < len(mlist) - 1) and (isinstance(mlist[i+1], torch.nn.BatchNorm2d)):
-                if args.verbose:
-                    print(f"Found fusable conv & BN layers at {name}[0][{i}(+1)]")
-                # TODO: implement fusing here
 
-                # Don't add the BN layer to the new module list since it's now fused
-                i += 1
-        i += 1
-    print(new_mlist)
-    new_module = nn.Module()
-    setattr(new_module, name, )
-    n = torch.nn.ModuleList(new_mlist)
-    print(n)
-    torch.save(n.state_dict(), "n.pt")
+# Load the fused model architecture (no BatchNorm layers)
+fused_module = importlib.import_module(args.fused_module)
+fused_nn = getattr(fused_module, args.nn_name)()
 
-# Convert *only* the weights and biases
-new_state_dict = {}
-for key, val in input_state_dict.items():
-    pass
+# Put original model in eval mode (so BN uses running stats, not batch stats)
+original_nn.eval()
+
+# For each target module, fuse conv+bn pairs and collect the fused layers
+for module_name in args.nn_module:
+    original_mlist = getattr(original_nn, module_name)
+
+    # Each element in the ModuleList is a Sequential
+    for seq_idx, seq in enumerate(original_mlist):
+        layers = list(seq.children())
+        new_layers = []
+        i = 0
+        while i < len(layers):
+            if isinstance(layers[i], torch.nn.Conv2d):
+                if i + 1 < len(layers) and isinstance(layers[i + 1], torch.nn.BatchNorm2d):
+                    if args.verbose:
+                        print(f"Fusing {module_name}.{seq_idx}[{i}] Conv2d + [{i+1}] BatchNorm2d")
+                    fused = fuse_conv_bn(layers[i], layers[i + 1])
+                    new_layers.append(fused)
+                    i += 2  # skip the BN layer
+                    continue
+            new_layers.append(layers[i])
+            i += 1
+
+        # Replace the Sequential in the original model with fused layers
+        original_mlist[seq_idx] = torch.nn.Sequential(*new_layers)
+
+# Now the original_nn has fused weights and no BN layers in target modules.
+# Its structure should match fused_nn. Extract and load the state dict.
+fused_state_dict = original_nn.state_dict()
+
+try:
+    fused_nn.load_state_dict(fused_state_dict, strict=True)
+except RuntimeError as err:
+    print(f"Fused state dict does not match fused NN architecture: {err}")
+    print("Check that --fused_module matches the original module but without BatchNorm layers.")
+    sys.exit(1)
 
 # Save the new state dict
-# Wrapped in a new dict to effectively remove all other things like epoch or optimizer_state_dict
-# torch.save(dict(model_state_dict=new_state_dict), args.output)
+torch.save(dict(model_state_dict=fused_nn.state_dict()), args.output)
 
 print(f"Output saved to {args.output}")
